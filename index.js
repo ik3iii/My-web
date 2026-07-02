@@ -14,12 +14,12 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN);
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const CHANNEL = process.env.CHANNEL_ID;
-const USERS = ["BBCWorld", "Reuters", "elonmusk"]; // مصادر X
+const USERS = ["BBCWorld", "Reuters", "elonmusk"];
 
 const FILE = "seen.json";
 
 /* =======================
-   STORAGE (NO DUPLICATES)
+   STORAGE
 ======================= */
 function loadSeen() {
   if (!fs.existsSync(FILE)) return new Set();
@@ -37,24 +37,35 @@ function makeId(text) {
 }
 
 /* =======================
-   AI FILTER (NEWS OR NOT)
+   AI CLASSIFIER (UPDATED)
 ======================= */
-async function isNews(text) {
+async function classifyContent(text) {
   try {
     const res = await client.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content: "أجب فقط yes إذا النص خبر حقيقي، أو no إذا ليس خبر",
+          content: `
+أنت نظام تصنيف أخبار دقيق.
+
+صنف النص إلى واحد فقط:
+
+- news → خبر حقيقي فيه حدث + جهة + معنى واضح
+- opinion → تحليل أو رأي
+- clickbait → عنوان مضلل أو مبالغ فيه
+- irrelevant → غير خبري (نصائح، صحة، ترفيه...)
+
+أجب بكلمة واحدة فقط بدون شرح.
+          `,
         },
         { role: "user", content: text },
       ],
     });
 
-    return res.choices[0].message.content.toLowerCase().includes("yes");
+    return res.choices[0].message.content.trim().toLowerCase();
   } catch {
-    return false;
+    return "irrelevant";
   }
 }
 
@@ -88,7 +99,7 @@ async function fetchX(user) {
 }
 
 /* =======================
-   SEND TO TELEGRAM
+   TELEGRAM SEND
 ======================= */
 async function sendNews(title, text, link) {
   const msg = `📰 ${title}\n\n${text}\n\n🔗 ${link}`;
@@ -109,8 +120,10 @@ async function run() {
 
       if (seen.has(id)) continue;
 
-      const check = await isNews(post.description);
-      if (!check) continue;
+      const type = await classifyContent(post.description);
+
+      // 🚫 فلترة قوية
+      if (type !== "news") continue;
 
       await sendNews(post.title, post.description, post.link);
 
