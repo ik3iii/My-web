@@ -14,18 +14,28 @@ const GITHUB_FILE_PATH = 'news_fingerprints.json';
 
 const PORT = process.env.PORT || 3000;
 
+// ========== مصادر جديدة من X عبر Nitter RSS (عراقية) ==========
 const RSS_SOURCES = [
-  'https://baghdadtoday.news/rss.xml',
-  'https://www.rudaw.net/rss.aspx?type=news',
-  'https://www.alsumaria.tv/rss/iraq-news',
-  'https://shafaq.com/ar/rss.xml',
-  'https://www.almaalomah.me/feed',
-  'https://www.ninanews.com/Website/News/rss',
-  'https://aletejahtv.iq/rss.xml',
-  'https://www.iraqpalm.com/feed',
-  'https://www.alsharqiya.com/feed',
-  'https://www.alforatnews.iq/index.php?format=feed&type=rss',
+  // وكالة الأنباء العراقية
+  'https://nitter.net/INA_Iraq/rss',
+  // شفق نيوز
+  'https://nitter.net/ShafaqNews/rss',
+  // السومرية نيوز
+  'https://nitter.net/alsumaria_news/rss',
+  // روداوو
+  'https://nitter.net/Rudaw_arabic/rss',
+  // بغداد اليوم
+  'https://nitter.net/BaghdadToday_/rss',
+  // الفرات نيوز
+  'https://nitter.net/AlforatNews/rss',
+  // الاتجاه
+  'https://nitter.net/aletejahtv/rss',
+  // واع (بديل)
+  'https://nitter.net/INA__iraq/rss',
 ];
+
+// إذا أردت إضافة أي حساب X آخر، فقط أضف رابطه بهذا الشكل:
+// 'https://nitter.net/اسم_المستخدم/rss'
 
 const FETCH_INTERVAL_MINUTES = 5;
 const SEND_DELAY_MS = { min: 2000, max: 5000 };
@@ -152,19 +162,12 @@ async function fetchFeed(url) {
   try {
     return await parser.parseURL(url);
   } catch {}
-  try {
-    const res = await axios.get(url, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/rss+xml' }, responseType: 'text' });
-    return await parser.parseString(res.data.replace(/<!DOCTYPE[^>]*>/gi, ''));
-  } catch {
-    throw new Error('فشل كل المحاولات');
-  }
+  throw new Error('فشل كل المحاولات');
 }
 
 function extractImage(item) {
+  // Nitter لا يضع صورًا مباشرة، لذا نبحث في المحتوى
   if (item.enclosure?.url) return item.enclosure.url;
-  if (item['media:content']?.url) return item['media:content'].url;
-  if (Array.isArray(item['media:content']) && item['media:content'][0]?.url) return item['media:content'][0].url;
-  if (item['media:thumbnail']?.url) return item['media:thumbnail'].url;
   const html = item['content:encoded'] || item.content || item.summary || '';
   const img = html.match(/<img[^>]+src=["']([^"']+\.(?:jpg|jpeg|png|webp|gif))["']/i);
   if (img) return img[1];
@@ -184,7 +187,11 @@ async function processItem(item) {
   const fp = getFingerprint(item);
   if (sentFingerprints.has(fp)) return;
 
-  const title = item.title || 'خبر';
+  // عنوان Nitter يكون غالبًا: "INA_Iraq: نص التغريدة"
+  let title = item.title || 'خبر';
+  // إزالة اسم المستخدم من البداية إن وجد
+  title = title.replace(/^[A-Za-z0-9_]+:\s*/, '');
+
   const emoji = ['🇮🇶','🔥','🚨','📌','⚡','🔴','📰','🌍'][Math.floor(Math.random()*8)];
   let caption = `${emoji} *${title}*`;
   if (hasBayyan(item) && item.link) caption += `\n\n[🔗 التفاصيل](${item.link})`;
@@ -227,14 +234,14 @@ async function mainCycle() {
   console.log('=== انتهت الدورة ===\n');
 }
 
-// خادم HTTP (مطلوب لـ Glitch)
+// خادم HTTP
 http.createServer((req, res) => {
   res.writeHead(200);
   res.end('Bot is running');
 }).listen(PORT, () => console.log(`🌐 خادم على ${PORT}`));
 
 async function start() {
-  console.log('🚀 تشغيل البوت على Glitch');
+  console.log('🚀 تشغيل البوت (X عبر Nitter RSS)');
   await loadFingerprints().catch(() => {});
   while (true) {
     await mainCycle().catch(err => console.error('[دورة فاشلة]', err.message));
