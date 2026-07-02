@@ -14,28 +14,17 @@ const GITHUB_FILE_PATH = 'news_fingerprints.json';
 
 const PORT = process.env.PORT || 3000;
 
-// ========== مصادر جديدة من X عبر Nitter RSS (عراقية) ==========
+// ========== مصادر X حصرًا (Nitter RSS) ==========
 const RSS_SOURCES = [
-  // وكالة الأنباء العراقية
   'https://nitter.net/INA_Iraq/rss',
-  // شفق نيوز
   'https://nitter.net/ShafaqNews/rss',
-  // السومرية نيوز
   'https://nitter.net/alsumaria_news/rss',
-  // روداوو
   'https://nitter.net/Rudaw_arabic/rss',
-  // بغداد اليوم
   'https://nitter.net/BaghdadToday_/rss',
-  // الفرات نيوز
   'https://nitter.net/AlforatNews/rss',
-  // الاتجاه
   'https://nitter.net/aletejahtv/rss',
-  // واع (بديل)
   'https://nitter.net/INA__iraq/rss',
 ];
-
-// إذا أردت إضافة أي حساب X آخر، فقط أضف رابطه بهذا الشكل:
-// 'https://nitter.net/اسم_المستخدم/rss'
 
 const FETCH_INTERVAL_MINUTES = 5;
 const SEND_DELAY_MS = { min: 2000, max: 5000 };
@@ -47,16 +36,18 @@ const parser = new Parser({
   headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TelegramNewsBot/1.0)' }
 });
 
+// ========== ذاكرة البصمات (سيتم ملؤها من GitHub) ==========
 const sentFingerprints = new Set();
-let pendingSaveCount = 0;
 let githubFileSha = null;
+let saveTimeout = null; // لحفظ دوري
 
+// أدوات مساعدة
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const randomDelay = () => sleep(Math.floor(Math.random() * (SEND_DELAY_MS.max - SEND_DELAY_MS.min + 1)) + SEND_DELAY_MS.min);
 
+// ========== إعداد اتصال محسّن ==========
 const agent = new https.Agent({ keepAlive: true, family: 4 });
 const telegramAxios = axios.create({ timeout: 20000, httpsAgent: agent });
-
 const githubAxios = axios.create({
   baseURL: 'https://api.github.com',
   headers: {
@@ -67,7 +58,7 @@ const githubAxios = axios.create({
   timeout: 12000
 });
 
-// ========== دوال GitHub ==========
+// ========== دوال GitHub (محسّنة) ==========
 async function loadFingerprints() {
   try {
     const res = await githubAxios.get(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE_PATH}`);
@@ -75,7 +66,13 @@ async function loadFingerprints() {
     const raw = Buffer.from(res.data.content, 'base64').toString('utf-8').trim();
     let arr = [];
     if (raw) {
-      try { arr = JSON.parse(raw); } catch { console.warn('[GITHUB] JSON تالف.'); }
+      try {
+        arr = JSON.parse(raw);
+      } catch {
+        console.warn('[GITHUB] ملف JSON تالف، سيتم إعادة إنشائه.');
+        await createEmptyFile();
+        return;
+      }
     }
     if (Array.isArray(arr)) {
       arr.forEach(fp => sentFingerprints.add(fp));
@@ -83,10 +80,11 @@ async function loadFingerprints() {
     }
   } catch (err) {
     if (err.response?.status === 404) {
-      console.log('[GITHUB] الملف غير موجود، إنشاء...');
-      await createEmptyFile().catch(() => {});
+      console.log('[GITHUB] الملف غير موجود، إنشاء جديد...');
+      await createEmptyFile();
     } else {
-      console.error('[GITHUB] فشل التحميل:', err.message);
+      console.error('[GITHUB] فشل التحميل (سنبدأ بذاكرة فارغة):', err.message);
+      // لا نتوقف، نبدأ بذاكرة فارغة
     }
   }
 }
@@ -98,25 +96,31 @@ async function createEmptyFile() {
     content
   });
   githubFileSha = res.data.content.sha;
-  console.log('[GITHUB] تم إنشاء الملف.');
+  console.log('[GITHUB] تم إنشاء ملف بصمات جديد.');
 }
 
 async function saveFingerprints() {
-  if (!githubFileSha || sentFingerprints.size === 0) return;
+  if (!githubFileSha) {
+    // إذا لم يكن لدينا SHA، نحاول تحميله أولاً
+    await loadFingerprints().catch(() => {});
+    if (!githubFileSha) return;
+  }
   try {
     const arr = Array.from(sentFingerprints);
     const content = Buffer.from(JSON.stringify(arr)).toString('base64');
     const res = await githubAxios.put(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE_PATH}`, {
-      message: `تحديث ${new Date().toISOString()}`,
+      message: `تحديث البصمات - ${new Date().toISOString()}`,
       content,
       sha: githubFileSha
     });
     githubFileSha = res.data.content.sha;
-    pendingSaveCount = 0;
-    console.log(`[GITHUB] حفظ ${arr.length} بصمة.`);
+    console.log(`[GITHUB] تم حفظ ${arr.length} بصمة.`);
   } catch (err) {
     console.error('[GITHUB] فشل الحفظ:', err.message);
-    if (err.response?.status === 409) await loadFingerprints().catch(() => {});
+    if (err.response?.status === 409) {
+      // تضارب في SHA، نعيد تحميل الملف ثم نحاول الحفظ لاحقًا
+      await loadFingerprints().catch(() => {});
+    }
   }
 }
 
@@ -153,7 +157,7 @@ async function sendPhoto(photoUrl, caption, options = {}) {
   });
 }
 
-// ========== دوال RSS ==========
+// ========== دوال RSS (خاصة بـ Nitter) ==========
 async function fetchFeed(url) {
   try {
     const res = await axios.get(url, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' }, responseType: 'text' });
@@ -162,12 +166,10 @@ async function fetchFeed(url) {
   try {
     return await parser.parseURL(url);
   } catch {}
-  throw new Error('فشل كل المحاولات');
+  throw new Error('فشل جلب الخلاصة');
 }
 
 function extractImage(item) {
-  // Nitter لا يضع صورًا مباشرة، لذا نبحث في المحتوى
-  if (item.enclosure?.url) return item.enclosure.url;
   const html = item['content:encoded'] || item.content || item.summary || '';
   const img = html.match(/<img[^>]+src=["']([^"']+\.(?:jpg|jpeg|png|webp|gif))["']/i);
   if (img) return img[1];
@@ -185,11 +187,13 @@ function getFingerprint(item) {
 
 async function processItem(item) {
   const fp = getFingerprint(item);
-  if (sentFingerprints.has(fp)) return;
+  if (sentFingerprints.has(fp)) {
+    console.log(`[SKIP DUPLICATE] ${item.title}`);
+    return;
+  }
 
-  // عنوان Nitter يكون غالبًا: "INA_Iraq: نص التغريدة"
   let title = item.title || 'خبر';
-  // إزالة اسم المستخدم من البداية إن وجد
+  // Nitter يصيغ العنوان كـ "username: النص"، نزيل اسم المستخدم
   title = title.replace(/^[A-Za-z0-9_]+:\s*/, '');
 
   const emoji = ['🇮🇶','🔥','🚨','📌','⚡','🔴','📰','🌍'][Math.floor(Math.random()*8)];
@@ -203,12 +207,16 @@ async function processItem(item) {
     console.log(`[SENT] ${title}`);
   } catch (err) {
     console.error(`[SKIP] ${title}:`, err.message);
-    return;
+    return; // لا نضيف البصمة إذا فشل الإرسال
   }
 
+  // أضف البصمة واحفظ فورًا
   sentFingerprints.add(fp);
-  pendingSaveCount++;
-  if (pendingSaveCount >= 10) await saveFingerprints().catch(() => {});
+  // حفظ فوري بعد كل خبر جديد (مع تأخير بسيط لتجميع عدة أخبار)
+  if (saveTimeout) clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(() => {
+    saveFingerprints().catch(() => {});
+  }, 5000); // حفظ بعد 5 ثوانٍ من آخر خبر
 }
 
 async function processSource(url) {
@@ -240,14 +248,27 @@ http.createServer((req, res) => {
   res.end('Bot is running');
 }).listen(PORT, () => console.log(`🌐 خادم على ${PORT}`));
 
+// ========== بدء التشغيل ==========
 async function start() {
-  console.log('🚀 تشغيل البوت (X عبر Nitter RSS)');
+  console.log('🚀 تشغيل بوت أخبار X (Nitter RSS)');
+  
+  // تحميل البصمات من GitHub
   await loadFingerprints().catch(() => {});
-  while (true) {
+
+  // تشغيل الدورة الأولى
+  await mainCycle().catch(err => console.error('[دورة فاشلة]', err.message));
+
+  // جدولة الدورات
+  setInterval(async () => {
     await mainCycle().catch(err => console.error('[دورة فاشلة]', err.message));
-    console.log(`انتظار ${FETCH_INTERVAL_MINUTES} دقائق...`);
-    await sleep(FETCH_INTERVAL_MINUTES * 60000);
-  }
+  }, FETCH_INTERVAL_MINUTES * 60000);
+
+  // حفظ دوري احتياطي كل 3 دقائق
+  setInterval(async () => {
+    if (sentFingerprints.size > 0) {
+      await saveFingerprints().catch(() => {});
+    }
+  }, 3 * 60000);
 }
 
 process.on('uncaughtException', (err) => console.error('[UNCAUGHT]', err));
