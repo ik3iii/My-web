@@ -125,7 +125,13 @@ async function run() {
       // 🚫 فلترة قوية
       if (type !== "news") continue;
 
-      await sendNews(post.title, post.description, post.link);
+      const summary = await summarizeNews(post.description);
+
+await sendNews(
+  post.title,
+  summary,
+  post.link
+);
 
       seen.add(id);
       saveSeen(seen);
@@ -136,5 +142,34 @@ async function run() {
 /* =======================
    START BOT
 ======================= */
+async function summarizeNews(text) {
+  try {
+    const res = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `
+أنت محرر أخبار محترف.
+
+مهمتك:
+- اختصر الخبر إلى 2-3 جمل فقط
+- ركز على: الحدث + من + أين + ماذا حصل
+- احذف الحشو والعناوين التسويقية
+- لا تضف رأي أو تحليل
+- لا تطول
+
+أجب مباشرة بدون مقدمات.
+          `
+        },
+        { role: "user", content: text }
+      ]
+    });
+
+    return res.choices[0].message.content.trim();
+  } catch {
+    return text;
+  }
+       }
 run();
 setInterval(run, 60 * 1000);
