@@ -1,10 +1,8 @@
-// ==================== بوت الأخبار العراقي (إصدار SQLite + DeepSeek AI) ====================
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const Parser = require('rss-parser');
 const axios = require('axios');
 const fs = require('fs');
-const path = require('path');
 const OpenAI = require('openai');
 const Database = require('better-sqlite3');
 
@@ -13,305 +11,212 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_ID = parseInt(process.env.ADMIN_USER_ID);
 const CHANNEL = '@EGIIIU';
 const NITTER_ACCOUNTS = process.env.NITTER_ACCOUNTS.split(',').map(s => s.trim());
-const FETCH_INTERVAL = (parseInt(process.env.FETCH_INTERVAL_MINUTES) || 1) * 60 * 1000;
-const ACTIVE_DURATION = 15 * 60 * 1000;   // 15 دقيقة
-const REST_DURATION = 3 * 60 * 1000;     // 3 دقائق
+const FETCH_INTERVAL = 60_000; // كل دقيقة داخل النشاط
+const ACTIVE_DURATION = 15 * 60_000;  // 15 دقيقة
+const REST_DURATION = 3 * 60_000;    // 3 دقائق
+const MAX_NEWS_AGE_MINUTES = 30;     // ← 30 دقيقة (وليس 30 ساعة)
 
-// GitHub للنسخ الاحتياطي (اختياري)
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO;
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 
-// DeepSeek API
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
-const deepseek = DEEPSEEK_API_KEY ? new OpenAI({
+// DeepSeek
+const deepseek = new OpenAI({
   baseURL: 'https://api.deepseek.com',
-  apiKey: DEEPSEEK_API_KEY,
-}) : null;
+  apiKey: process.env.DEEPSEEK_API_KEY,
+});
 
-// قاعدة البيانات
-const DB_FILE = 'news_bot.db';
-const db = new Database(DB_FILE);
-
-// تهيئة قاعدة البيانات
+// ---------- قاعدة البيانات ----------
+const db = new Database('news_bot.db');
 db.pragma('journal_mode = WAL');
 db.exec(`
-  CREATE TABLE IF NOT EXISTS news (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    hash TEXT UNIQUE,
+  CREATE TABLE IF NOT EXISTS published (
+    hash TEXT PRIMARY KEY,
     title TEXT,
     link TEXT,
     pub_date TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at INTEGER DEFAULT (strftime('%s','now'))
   );
-  CREATE INDEX IF NOT EXISTS idx_hash ON news(hash);
   CREATE TABLE IF NOT EXISTS last_pub_date (
     account TEXT PRIMARY KEY,
     last_date TEXT
   );
 `);
 
-// ---------- أدوات السجل ----------
+const insertHash = db.prepare('INSERT OR IGNORE INTO published (hash, title, link, pub_date) VALUES (?, ?, ?, ?)');
+const isHashExist = db.prepare('SELECT 1 FROM published WHERE hash = ?').pluck();
+const getLastDate = db.prepare('SELECT last_date FROM last_pub_date WHERE account = ?').pluck();
+const setLastDate = db.prepare('INSERT OR REPLACE INTO last_pub_date (account, last_date) VALUES (?, ?)');
+
+// ---------- سجل ----------
 const logLines = [];
 function log(msg) {
-  const timestamp = new Date().toISOString();
-  const line = `[${timestamp}] ${msg}`;
+  const time = new Date().toISOString();
+  const line = `[${time}] ${msg}`;
   console.log(line);
   logLines.push(line);
   if (logLines.length > 100) logLines.shift();
 }
 
-// ---------- دوال قاعدة البيانات ----------
-function isNewsDuplicate(hash) {
-  return db.prepare('SELECT id FROM news WHERE hash = ?').get(hash) !== undefined;
-}
+// ---------- AI صياغة وتصنيف ----------
+async function summarizeAndClassify(item) {
+  const title = item.title || '';
+  const desc = item.contentSnippet || item.content || '';
+  const fullText = `العنوان: ${title}\nالمحتوى: ${desc}`;
 
-function saveNewsHash(hash, title, link, pubDate) {
-  try {
-    db.prepare('INSERT OR IGNORE INTO news (hash, title, link, pub_date) VALUES (?, ?, ?, ?)').run(hash, title, link, pubDate);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-function getLastPubDate(account) {
-  const row = db.prepare('SELECT last_date FROM last_pub_date WHERE account = ?').get(account);
-  return row ? row.last_date : null;
-}
-
-function updateLastPubDate(account, pubDate) {
-  db.prepare('INSERT OR REPLACE INTO last_pub_date (account, last_date) VALUES (?, ?)').run(account, pubDate);
-}
-
-// احتياطي GitHub (رفع قاعدة البيانات كاملة)
-async function backupToGitHub() {
-  if (!GITHUB_TOKEN || !GITHUB_REPO) return;
-  const [owner, repo] = GITHUB_REPO.split('/');
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${DB_FILE}`;
-  const dbContent = fs.readFileSync(DB_FILE);
-  const base64Content = dbContent.toString('base64');
-  try {
-    let sha = null;
-    try {
-      const getRes = await axios.get(apiUrl, {
-        headers: { Authorization: `token ${GITHUB_TOKEN}` },
-        params: { ref: GITHUB_BRANCH }
-      });
-      sha = getRes.data.sha;
-    } catch (e) {}
-    await axios.put(apiUrl, {
-      message: 'تحديث قاعدة البيانات ' + new Date().toISOString(),
-      content: base64Content,
-      branch: GITHUB_BRANCH,
-      sha: sha
-    }, {
-      headers: { Authorization: `token ${GITHUB_TOKEN}` }
-    });
-    log('☁️ تم رفع قاعدة البيانات إلى GitHub.');
-  } catch (e) {
-    log('❌ فشل رفع قاعدة البيانات إلى GitHub: ' + e.message);
-  }
-}
-
-// ---------- DeepSeek AI صياغة الخبر ----------
-async function formatNewsWithAI(title, description) {
-  if (!deepseek) {
-    return title; // إرجاع العنوان فقط إذا لم يتوفر AI
-  }
-  const text = `العنوان: ${title}\nالوصف: ${description || ''}`;
   try {
     const response = await deepseek.chat.completions.create({
       model: 'deepseek-chat',
       messages: [
         {
           role: 'system',
-          content: `أنت محرر أخبار عراقي محترف. قم بصياغة الخبر التالي في جملة أو جملتين باللغة العربية، بأسلوب موجز ومناسب للنشر على قناة تيليجرام. أضف إيموجي مناسب في البداية. لا تضف أي تعليقات إضافية.`
+          content: `أنت محرر أخبار عراقي. مهمتك:
+1. صغ الخبر في جملة أو جملتين موجزتين بالعربية، مناسبة للنشر في قناة تيليجرام.
+2. ابدأ الخبر بإيموجي مناسب.
+3. إذا كان النص ليس خبرًا سياسيًا أو أمنيًا أو اقتصاديًا أو عاجلًا عن العراق، اكتب "غير_خبر" فقط.
+لا تقدم أي تعليق خارج التنسيق المطلوب.`
         },
-        {
-          role: 'user',
-          content: `صغ الخبر التالي:\n${text}`
-        }
+        { role: 'user', content: fullText }
       ],
       max_tokens: 200,
-      temperature: 0.7,
+      temperature: 0.3,
     });
-    const formatted = response.choices[0]?.message?.content?.trim();
-    if (formatted) {
-      return formatted;
+
+    const result = response.choices[0]?.message?.content?.trim() || '';
+    if (result === 'غير_خبر') {
+      return { relevant: false, formatted: null };
     }
+    return { relevant: true, formatted: result };
   } catch (err) {
-    log(`❌ فشل صياغة AI للخبر "${title}": ${err.message}`);
-  }
-  // في حال الفشل، نرجع عنوانًا منسقًا يدويًا
-  return `📰 ${title}`;
-}
-
-// ---------- جلب RSS ----------
-const rssParser = new Parser({
-  customFields: {
-    item: ['media:content', 'enclosure', 'description']
-  }
-});
-
-async function fetchRSS(account) {
-  const url = `https://nitter.net/${account}/rss`;
-  try {
-    const feed = await rssParser.parseURL(url);
-    return feed.items || [];
-  } catch (e) {
-    log(`❌ فشل جلب RSS من ${account}: ${e.message}`);
-    return [];
+    log(`❌ AI error: ${err.message}`);
+    return { relevant: false, formatted: null };
   }
 }
 
-function extractMedia(item) {
-  // استخراج رابط الصورة أو الفيديو
-  if (item.enclosure) {
+// ---------- استخراج الوسائط ----------
+function getMedia(item) {
+  if (item.enclosure && item.enclosure.url) {
     const type = item.enclosure.type || '';
-    if (type.startsWith('image/') || type.startsWith('video/')) {
-      return { url: item.enclosure.url, type: type.startsWith('video/') ? 'video' : 'photo' };
-    }
+    if (type.startsWith('image/')) return { type: 'photo', url: item.enclosure.url };
+    if (type.startsWith('video/')) return { type: 'video', url: item.enclosure.url };
   }
-  if (item['media:content']) {
+  if (item['media:content'] && item['media:content'].$) {
     const url = item['media:content'].$.url;
     const type = item['media:content'].$.type || '';
-    return { url, type: type.startsWith('video/') ? 'video' : 'photo' };
+    if (type.startsWith('video/')) return { type: 'video', url };
+    return { type: 'photo', url };
   }
-  // قد يكون هناك وصف يحتوي على روابط وسائط
   return null;
 }
 
-// ---------- إرسال الخبر ----------
+// ---------- معالجة الأخبار ----------
+const rssParser = new Parser({
+  customFields: { item: ['media:content', 'enclosure'] }
+});
+
 const bot = new Telegraf(BOT_TOKEN);
 
-async function sendNews(formattedText, item) {
-  const media = extractMedia(item);
-  const link = item.link;
+async function processAccounts() {
+  const now = Date.now();
 
-  try {
-    if (media) {
-      if (media.type === 'video') {
-        await bot.telegram.sendVideo(CHANNEL, media.url, {
-          caption: formattedText + (link ? `\n\n🔗 التفاصيل: ${link}` : ''),
-          parse_mode: 'HTML'
-        });
-      } else {
-        await bot.telegram.sendPhoto(CHANNEL, media.url, {
-          caption: formattedText + (link ? `\n\n🔗 التفاصيل: ${link}` : ''),
-          parse_mode: 'HTML'
-        });
-      }
-    } else {
-      await bot.telegram.sendMessage(CHANNEL, formattedText + (link ? `\n\n🔗 التفاصيل: ${link}` : ''), {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true
-      });
-    }
-    return true;
-  } catch (e) {
-    log(`❌ فشل إرسال الخبر: ${e.message}`);
-    return false;
-  }
-}
-
-// ---------- معالجة الأخبار ----------
-async function processAllAccounts() {
   for (const account of NITTER_ACCOUNTS) {
-    const items = await fetchRSS(account);
-    if (items.length === 0) continue;
+    let items;
+    try {
+      items = await rssParser.parseURL(`https://nitter.net/${account}/rss`);
+      items = items.items || [];
+    } catch (e) {
+      log(`❌ فشل جلب RSS من ${account}: ${e.message}`);
+      continue;
+    }
 
-    // فرز العناصر حسب تاريخ النشر (من الأقدم للأحدث)
-    items.sort((a, b) => {
-      const dateA = new Date(a.pubDate || 0).getTime();
-      const dateB = new Date(b.pubDate || 0).getTime();
-      return dateA - dateB;
-    });
+    // الأحدث أولاً
+    items.sort((a, b) => new Date(b.pubDate || 0) - new Date(a.pubDate || 0));
 
-    // جلب آخر تاريخ نشر تمت معالجته
-    const lastDate = getLastPubDate(account);
-    let latestProcessedDate = lastDate;
+    const lastDateStr = getLastDate.get(account);
+    let newLatestDate = lastDateStr ? new Date(lastDateStr) : null;
 
     for (const item of items) {
-      const pubDate = item.pubDate || new Date().toISOString();
-      // تجاهل الأخبار الأقدم من آخر تاريخ معالج (لتجنب القديم)
-      if (lastDate && new Date(pubDate) <= new Date(lastDate)) {
+      const pubDate = item.pubDate ? new Date(item.pubDate) : null;
+      if (!pubDate || isNaN(pubDate.getTime())) continue;
+
+      // تجاهل إذا كان الخبر أقدم من 30 دقيقة
+      const ageMs = now - pubDate.getTime();
+      if (ageMs > MAX_NEWS_AGE_MINUTES * 60 * 1000) {
         continue;
       }
 
-      const title = item.title || 'بدون عنوان';
-      const description = item.contentSnippet || item.content || '';
+      // تجاهل أقدم من آخر تاريخ معالج
+      if (lastDateStr && pubDate <= new Date(lastDateStr)) {
+        continue;
+      }
 
-      // توليد بصمة فريدة
-      const hash = require('crypto').createHash('sha256').update(title + description.substring(0, 60)).digest('hex');
+      const title = item.title || '';
+      const desc = item.contentSnippet || item.content || '';
+      const hash = require('crypto').createHash('sha256').update(title + desc.substring(0, 60)).digest('hex');
 
-      if (isNewsDuplicate(hash)) continue; // مكرر
+      if (isHashExist.get(hash)) continue;
 
-      // صياغة الخبر بالذكاء الاصطناعي
-      const formattedText = await formatNewsWithAI(title, description);
+      const { relevant, formatted } = await summarizeAndClassify(item);
+      if (!relevant) {
+        log(`🚫 تجاهل (غير إخباري): ${title.substring(0, 60)}`);
+        continue;
+      }
 
-      // إرسال الخبر
-      const sent = await sendNews(formattedText, item);
-      if (sent) {
-        // حفظ البصمة في قاعدة البيانات
-        saveNewsHash(hash, title, item.link, pubDate);
-        // تحديث آخر تاريخ
-        if (!latestProcessedDate || new Date(pubDate) > new Date(latestProcessedDate)) {
-          latestProcessedDate = pubDate;
+      const link = item.link;
+      let caption = formatted;
+      if (link) caption += `\n\n🔗 التفاصيل: ${link}`;
+
+      const media = getMedia(item);
+
+      try {
+        if (media && media.type === 'video') {
+          await bot.telegram.sendVideo(CHANNEL, media.url, { caption, parse_mode: 'HTML' });
+        } else if (media && media.type === 'photo') {
+          await bot.telegram.sendPhoto(CHANNEL, media.url, { caption, parse_mode: 'HTML' });
+        } else {
+          await bot.telegram.sendMessage(CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
         }
-        // تأخير بسيط بين الإرسال
-        await new Promise(resolve => setTimeout(resolve, 1500));
-      } else {
-        log(`⏳ فشل إرسال "${title}"، سيُعاد لاحقاً.`);
+
+        insertHash.run(hash, title, link, item.pubDate);
+        log(`✅ نشر: ${formatted.substring(0, 60)}`);
+
+        if (!newLatestDate || pubDate > newLatestDate) {
+          newLatestDate = pubDate;
+        }
+
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (e) {
+        log(`❌ فشل إرسال "${title}": ${e.message}`);
       }
     }
 
-    // تحديث آخر تاريخ معالج للحساب
-    if (latestProcessedDate && latestProcessedDate !== lastDate) {
-      updateLastPubDate(account, latestProcessedDate);
+    if (newLatestDate && (!lastDateStr || newLatestDate > new Date(lastDateStr))) {
+      setLastDate.run(account, newLatestDate.toISOString());
     }
   }
 }
 
-// ---------- دورة النشاط / الراحة ----------
-let fetchTimer = null;
-let activeTimeout = null;
-let restTimeout = null;
+// ---------- دورة العمل ----------
+let timer, activeTimeout, restTimeout;
 
-function startActiveCycle() {
-  if (fetchTimer) clearInterval(fetchTimer);
-  log('🟢 بدء دورة النشاط (15 دقيقة).');
-  // جلب فوري
-  processAllAccounts().catch(e => log('خطأ: ' + e));
-  fetchTimer = setInterval(() => {
-    log('🔍 جلب دوري...');
-    processAllAccounts().catch(e => log('خطأ: ' + e));
-    // نسخ احتياطي كل 10 دقائق
-    backupToGitHub().catch(() => {});
+function startCycle() {
+  clearInterval(timer);
+  clearTimeout(activeTimeout);
+  clearTimeout(restTimeout);
+
+  log('🟢 بدء نافذة نشاط 15 دقيقة');
+  processAccounts();
+  timer = setInterval(() => {
+    log('🔄 جلب دوري...');
+    processAccounts().catch(e => log('خطأ: ' + e));
   }, FETCH_INTERVAL);
 
   activeTimeout = setTimeout(() => {
-    log('🔴 انتهت النشاط، راحة 3 دقائق.');
-    stopFetching();
-    restTimeout = setTimeout(() => {
-      startActiveCycle();
-    }, REST_DURATION);
+    log('🔴 نهاية النشاط، راحة 3 دقائق');
+    clearInterval(timer);
+    timer = null;
+    restTimeout = setTimeout(startCycle, REST_DURATION);
   }, ACTIVE_DURATION);
-}
-
-function stopFetching() {
-  if (fetchTimer) {
-    clearInterval(fetchTimer);
-    fetchTimer = null;
-  }
-  if (activeTimeout) {
-    clearTimeout(activeTimeout);
-    activeTimeout = null;
-  }
-  if (restTimeout) {
-    clearTimeout(restTimeout);
-    restTimeout = null;
-  }
 }
 
 // ---------- لوحة التحكم ----------
@@ -319,63 +224,54 @@ let expectingCodeUpdate = false;
 
 bot.on('document', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID || !expectingCodeUpdate) return;
-  const fileId = ctx.message.document.file_id;
-  const fileName = ctx.message.document.file_name || 'bot.js';
-  if (!fileName.endsWith('.js')) return ctx.reply('❌ يجب أن يكون الملف .js');
+  const file = ctx.message.document;
+  if (!file.file_name?.endsWith('.js')) return ctx.reply('❌ يجب أن يكون الملف .js');
   try {
-    const fileUrl = await bot.telegram.getFileLink(fileId);
-    const res = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
+    const url = await bot.telegram.getFileLink(file.file_id);
+    const res = await axios.get(url.href, { responseType: 'arraybuffer' });
     fs.writeFileSync(__filename, Buffer.from(res.data));
     ctx.reply('✅ تم تحديث الكود. إعادة التشغيل...');
-    log('🔄 إعادة تشغيل البوت لتطبيق الكود الجديد.');
-    stopFetching();
+    log('🔄 إعادة تشغيل بعد تحديث الكود');
+    clearInterval(timer);
+    clearTimeout(activeTimeout);
+    clearTimeout(restTimeout);
     setTimeout(() => process.exit(0), 1000);
   } catch (e) {
-    ctx.reply('❌ فشل التحديث: ' + e.message);
+    ctx.reply('❌ فشل: ' + e.message);
   }
   expectingCodeUpdate = false;
 });
 
-bot.command('start', (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ غير مصرح.');
-  ctx.reply('👋 مرحباً أدمن. أوامر: /status /logs /updatecode');
-});
-
-bot.command('status', (ctx) => {
+bot.command('start', ctx => {
   if (ctx.from.id !== ADMIN_ID) return;
-  const active = fetchTimer ? 'نشط' : 'متوقف';
-  const count = db.prepare('SELECT COUNT(*) as cnt FROM news').get().cnt;
-  ctx.reply(`✅ البوت يعمل\n📡 الجلب: ${active}\n📬 الأخبار المحفوظة: ${count}\n🕒 ${new Date().toLocaleString()}`);
+  ctx.reply('أهلاً أدمن. الأوامر:\n/status /logs /updatecode');
 });
 
-bot.command('logs', (ctx) => {
+bot.command('status', ctx => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const count = db.prepare('SELECT COUNT(*) FROM published').pluck().get();
+  const active = timer ? 'نشط' : 'متوقف';
+  ctx.reply(`✅ البوت: ${active}\n📬 الأخبار المحفوظة: ${count}\n🕒 ${new Date().toLocaleString()}`);
+});
+
+bot.command('logs', ctx => {
   if (ctx.from.id !== ADMIN_ID) return;
   if (logLines.length === 0) return ctx.reply('لا سجلات.');
-  ctx.reply(`📋 آخر ${logLines.length} سطر:\n<pre>${logLines.join('\n')}</pre>`, { parse_mode: 'HTML' });
+  ctx.reply(`<pre>${logLines.join('\n')}</pre>`, { parse_mode: 'HTML' });
 });
 
-bot.command('updatecode', (ctx) => {
+bot.command('updatecode', ctx => {
   if (ctx.from.id !== ADMIN_ID) return;
   expectingCodeUpdate = true;
-  ctx.reply('📥 أرسل ملف bot.js الجديد (خلال 30 ثانية).');
-  setTimeout(() => { expectingCodeUpdate = false; }, 30000);
+  ctx.reply('أرسل ملف bot.js الجديد خلال 30 ثانية.');
+  setTimeout(() => { expectingCodeUpdate = false; }, 30_000);
 });
 
-// ---------- تشغيل البوت ----------
-async function init() {
-  // تحميل قاعدة البيانات (قد تكون موجودة)
-  log(`📊 قاعدة البيانات جاهزة.`);
-
-  bot.launch();
-  log('🤖 بوت الأخبار بدأ.');
-
-  startActiveCycle();
-}
-
-process.on('uncaughtException', (err) => log('💥 خطأ: ' + err.message));
-process.on('unhandledRejection', (reason) => log('⚠️ وعد: ' + reason));
-
-init().catch(err => {
-  log('فشل البدء: ' + err.message);
-  process.exit(1);
+// ---------- بدء التشغيل ----------
+bot.launch().then(() => {
+  log('🤖 بوت الأخبار يعمل (الحد الأقصى: 30 دقيقة)');
+  startCycle();
 });
+
+process.on('uncaughtException', err => log('💥 ' + err.message));
+process.on('unhandledRejection', reason => log('⚠️ ' + reason));
