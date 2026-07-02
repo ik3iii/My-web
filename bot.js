@@ -1,11 +1,12 @@
+// ==================== بوت الأخبار العراقي (إصدار SQLite + DeepSeek AI) ====================
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const Parser = require('rss-parser');
 const axios = require('axios');
 const fs = require('fs');
-const crypto = require('crypto');
 const path = require('path');
 const OpenAI = require('openai');
+const Database = require('better-sqlite3');
 
 // ---------- الإعدادات ----------
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -13,14 +14,13 @@ const ADMIN_ID = parseInt(process.env.ADMIN_USER_ID);
 const CHANNEL = '@EGIIIU';
 const NITTER_ACCOUNTS = process.env.NITTER_ACCOUNTS.split(',').map(s => s.trim());
 const FETCH_INTERVAL = (parseInt(process.env.FETCH_INTERVAL_MINUTES) || 1) * 60 * 1000;
-const ACTIVE_DURATION = 15 * 60 * 1000;   // 15 دقيقة نشاط
-const REST_DURATION = 3 * 60 * 1000;      // 3 دقائق راحة
+const ACTIVE_DURATION = 15 * 60 * 1000;   // 15 دقيقة
+const REST_DURATION = 3 * 60 * 1000;     // 3 دقائق
 
+// GitHub للنسخ الاحتياطي (اختياري)
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO;
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
-const HASHES_FILE = 'hashes.json';
-const FILTERS_FILE = 'filters.json';
 
 // DeepSeek API
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
@@ -28,7 +28,28 @@ const deepseek = DEEPSEEK_API_KEY ? new OpenAI({
   baseURL: 'https://api.deepseek.com',
   apiKey: DEEPSEEK_API_KEY,
 }) : null;
-const USE_AI_FILTER = !!deepseek;
+
+// قاعدة البيانات
+const DB_FILE = 'news_bot.db';
+const db = new Database(DB_FILE);
+
+// تهيئة قاعدة البيانات
+db.pragma('journal_mode = WAL');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS news (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash TEXT UNIQUE,
+    title TEXT,
+    link TEXT,
+    pub_date TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_hash ON news(hash);
+  CREATE TABLE IF NOT EXISTS last_pub_date (
+    account TEXT PRIMARY KEY,
+    last_date TEXT
+  );
+`);
 
 // ---------- أدوات السجل ----------
 const logLines = [];
@@ -40,52 +61,36 @@ function log(msg) {
   if (logLines.length > 100) logLines.shift();
 }
 
-// ---------- البصمات ----------
-let seenHashes = new Set();
+// ---------- دوال قاعدة البيانات ----------
+function isNewsDuplicate(hash) {
+  return db.prepare('SELECT id FROM news WHERE hash = ?').get(hash) !== undefined;
+}
 
-function loadLocalHashes() {
+function saveNewsHash(hash, title, link, pubDate) {
   try {
-    if (fs.existsSync(HASHES_FILE)) {
-      const data = JSON.parse(fs.readFileSync(HASHES_FILE, 'utf8'));
-      seenHashes = new Set(data);
-      log(`✅ تم تحميل ${seenHashes.size} بصمة محلية.`);
-    } else {
-      log('ℹ️ لا يوجد ملف بصمات محلي.');
-    }
+    db.prepare('INSERT OR IGNORE INTO news (hash, title, link, pub_date) VALUES (?, ?, ?, ?)').run(hash, title, link, pubDate);
+    return true;
   } catch (e) {
-    log('⚠️ فشل تحميل البصمات المحلية: ' + e.message);
+    return false;
   }
 }
 
-function saveLocalHashes() {
-  try {
-    fs.writeFileSync(HASHES_FILE, JSON.stringify([...seenHashes], null, 2), 'utf8');
-  } catch (e) {
-    log('❌ فشل حفظ البصمات محلياً: ' + e.message);
-  }
+function getLastPubDate(account) {
+  const row = db.prepare('SELECT last_date FROM last_pub_date WHERE account = ?').get(account);
+  return row ? row.last_date : null;
 }
 
-async function fetchRemoteHashes() {
-  if (!GITHUB_TOKEN || !GITHUB_REPO) return;
-  const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${HASHES_FILE}`;
-  try {
-    const res = await axios.get(url, { timeout: 10000 });
-    if (res.data && Array.isArray(res.data)) {
-      seenHashes = new Set(res.data);
-      log(`☁️ تم تحميل ${seenHashes.size} بصمة من GitHub.`);
-      saveLocalHashes();
-    }
-  } catch (e) {
-    log('⚠️ تعذر جلب البصمات من GitHub.');
-  }
+function updateLastPubDate(account, pubDate) {
+  db.prepare('INSERT OR REPLACE INTO last_pub_date (account, last_date) VALUES (?, ?)').run(account, pubDate);
 }
 
-async function pushHashesToGitHub() {
+// احتياطي GitHub (رفع قاعدة البيانات كاملة)
+async function backupToGitHub() {
   if (!GITHUB_TOKEN || !GITHUB_REPO) return;
   const [owner, repo] = GITHUB_REPO.split('/');
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${HASHES_FILE}`;
-  const content = JSON.stringify([...seenHashes], null, 2);
-  const base64Content = Buffer.from(content).toString('base64');
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${DB_FILE}`;
+  const dbContent = fs.readFileSync(DB_FILE);
+  const base64Content = dbContent.toString('base64');
   try {
     let sha = null;
     try {
@@ -96,42 +101,56 @@ async function pushHashesToGitHub() {
       sha = getRes.data.sha;
     } catch (e) {}
     await axios.put(apiUrl, {
-      message: 'تحديث البصمات ' + new Date().toISOString(),
+      message: 'تحديث قاعدة البيانات ' + new Date().toISOString(),
       content: base64Content,
       branch: GITHUB_BRANCH,
       sha: sha
+    }, {
+      headers: { Authorization: `token ${GITHUB_TOKEN}` }
     });
-    log('☁️ تم رفع البصمات إلى GitHub.');
+    log('☁️ تم رفع قاعدة البيانات إلى GitHub.');
   } catch (e) {
-    log('❌ فشل رفع البصمات إلى GitHub: ' + e.message);
+    log('❌ فشل رفع قاعدة البيانات إلى GitHub: ' + e.message);
   }
 }
 
-// ---------- قوائم التصفية ----------
-let WHITELIST = [];
-let BLACKLIST = [];
-
-function loadFilters() {
+// ---------- DeepSeek AI صياغة الخبر ----------
+async function formatNewsWithAI(title, description) {
+  if (!deepseek) {
+    return title; // إرجاع العنوان فقط إذا لم يتوفر AI
+  }
+  const text = `العنوان: ${title}\nالوصف: ${description || ''}`;
   try {
-    if (fs.existsSync(FILTERS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(FILTERS_FILE, 'utf8'));
-      if (data.whitelist) WHITELIST = data.whitelist;
-      if (data.blacklist) BLACKLIST = data.blacklist;
-      log(`✅ قوائم التصفية: (أبيض: ${WHITELIST.length}, أسود: ${BLACKLIST.length})`);
+    const response = await deepseek.chat.completions.create({
+      model: 'deepseek-chat',
+      messages: [
+        {
+          role: 'system',
+          content: `أنت محرر أخبار عراقي محترف. قم بصياغة الخبر التالي في جملة أو جملتين باللغة العربية، بأسلوب موجز ومناسب للنشر على قناة تيليجرام. أضف إيموجي مناسب في البداية. لا تضف أي تعليقات إضافية.`
+        },
+        {
+          role: 'user',
+          content: `صغ الخبر التالي:\n${text}`
+        }
+      ],
+      max_tokens: 200,
+      temperature: 0.7,
+    });
+    const formatted = response.choices[0]?.message?.content?.trim();
+    if (formatted) {
+      return formatted;
     }
-  } catch (e) {
-    log('⚠️ فشل تحميل قوائم التصفية.');
+  } catch (err) {
+    log(`❌ فشل صياغة AI للخبر "${title}": ${err.message}`);
   }
+  // في حال الفشل، نرجع عنوانًا منسقًا يدويًا
+  return `📰 ${title}`;
 }
 
-function saveFilters() {
-  fs.writeFileSync(FILTERS_FILE, JSON.stringify({ whitelist: WHITELIST, blacklist: BLACKLIST }, null, 2), 'utf8');
-}
-
-// ---------- أدوات RSS ----------
+// ---------- جلب RSS ----------
 const rssParser = new Parser({
   customFields: {
-    item: ['media:content', 'enclosure']
+    item: ['media:content', 'enclosure', 'description']
   }
 });
 
@@ -146,97 +165,52 @@ async function fetchRSS(account) {
   }
 }
 
-function extractImageUrl(item) {
-  if (item.enclosure && item.enclosure.url && item.enclosure.type && item.enclosure.type.startsWith('image/')) {
-    return item.enclosure.url;
+function extractMedia(item) {
+  // استخراج رابط الصورة أو الفيديو
+  if (item.enclosure) {
+    const type = item.enclosure.type || '';
+    if (type.startsWith('image/') || type.startsWith('video/')) {
+      return { url: item.enclosure.url, type: type.startsWith('video/') ? 'video' : 'photo' };
+    }
   }
-  if (item['media:content'] && item['media:content'].$.url) {
-    return item['media:content'].$.url;
+  if (item['media:content']) {
+    const url = item['media:content'].$.url;
+    const type = item['media:content'].$.type || '';
+    return { url, type: type.startsWith('video/') ? 'video' : 'photo' };
   }
+  // قد يكون هناك وصف يحتوي على روابط وسائط
   return null;
-}
-
-function generateHash(title, description) {
-  const descPart = (description || '').substring(0, 60);
-  const raw = `${title}|${descPart}`;
-  return crypto.createHash('sha256').update(raw).digest('hex');
-}
-
-// ---------- DeepSeek AI تصفية ----------
-async function isRelevantNewsAI(title, description) {
-  if (!deepseek) return true;
-  const fullText = `العنوان: ${title}\nالمحتوى: ${description || 'لا يوجد وصف'}`;
-  try {
-    log(`🤖 تحليل AI للخبر: "${title.substring(0, 50)}..."`);
-    const response = await deepseek.chat.completions.create({
-      model: 'deepseek-chat',
-      messages: [
-        {
-          role: 'system',
-          content: `أنت مساعد لتصنيف الأخبار. حدد إذا كان الخبر "خبرًا عراقيًا جادًا" (سياسة، اقتصاد، أمن، مجتمع، كوارث، أحداث عاجلة، أخبار محلية) أم "غير جاد" (ترفيه، رياضة، صحة عامة، نصائح، إعلانات، محتوى غير إخباري). أجب فقط بكلمة "جاد" أو "غير جاد".`
-        },
-        {
-          role: 'user',
-          content: `صنف الخبر التالي:\n${fullText}`
-        }
-      ],
-      max_tokens: 5,
-      temperature: 0,
-    });
-    const answer = response.choices[0]?.message?.content?.trim();
-    const isRelevant = answer === 'جاد';
-    log(isRelevant ? '✅ AI: الخبر جاد' : '❌ AI: الخبر غير جاد');
-    return isRelevant;
-  } catch (err) {
-    log(`❌ فشل تحليل AI للخبر "${title}": ${err.message}`);
-    return true; // تمرير الخبر عند الخطأ
-  }
 }
 
 // ---------- إرسال الخبر ----------
 const bot = new Telegraf(BOT_TOKEN);
 
-async function sendNewsItem(item) {
-  const title = item.title || 'بدون عنوان';
-  const link = item.link || '';
-  const description = item.contentSnippet || item.content || '';
-  const imageUrl = extractImageUrl(item);
-
-  // بناء النص الكامل: العنوان + جزء من الوصف إن وجد
-  let fullCaption = title;
-  const descTrimmed = description ? description.trim() : '';
-  if (descTrimmed && descTrimmed.length > 10) {
-    // إضافة الوصف بشكل مختصر لجعل الخبر أكثر وضوحًا
-    const descPreview = descTrimmed.length > 150 ? descTrimmed.substring(0, 150) + '...' : descTrimmed;
-    fullCaption = title + '\n\n' + descPreview;
-  }
-
-  // تحديد إضافة رابط التفاصيل (دائمًا تقريبًا للاطلاع على الخبر كاملاً)
-  let addDetailsLink = true; // سنضيف الرابط دائمًا حيث أن التغريدة غالبًا مختصرة
-  // لكن نستثني إذا كان النص طويلًا جدًا (> 200 حرف) والرابط غير ضروري
-  if (fullCaption.length > 200 && !/بيان/i.test(title + ' ' + description)) {
-    addDetailsLink = false;
-  }
-
-  // إيموجي عشوائي
-  const emojis = ['📰', '🇮🇶', '🔥', '📢', '🚨', '📌', '💬', '📣', '🌐', '⚡', '📡'];
-  const randomEmoji = emojis[Math.floor(Math.random() * emojis.length)];
-
-  let message = `${randomEmoji} ${fullCaption}`;
-  if (addDetailsLink && link) {
-    message += `\n\n🔗 التفاصيل`;
-  }
+async function sendNews(formattedText, item) {
+  const media = extractMedia(item);
+  const link = item.link;
 
   try {
-    if (imageUrl) {
-      await bot.telegram.sendPhoto(CHANNEL, { url: imageUrl }, { caption: message, parse_mode: 'HTML' });
+    if (media) {
+      if (media.type === 'video') {
+        await bot.telegram.sendVideo(CHANNEL, media.url, {
+          caption: formattedText + (link ? `\n\n🔗 التفاصيل: ${link}` : ''),
+          parse_mode: 'HTML'
+        });
+      } else {
+        await bot.telegram.sendPhoto(CHANNEL, media.url, {
+          caption: formattedText + (link ? `\n\n🔗 التفاصيل: ${link}` : ''),
+          parse_mode: 'HTML'
+        });
+      }
     } else {
-      await bot.telegram.sendMessage(CHANNEL, message, { parse_mode: 'HTML', disable_web_page_preview: false });
+      await bot.telegram.sendMessage(CHANNEL, formattedText + (link ? `\n\n🔗 التفاصيل: ${link}` : ''), {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+      });
     }
-    log(`✅ تم إرسال: "${title.substring(0, 50)}..."`);
     return true;
   } catch (e) {
-    log(`❌ فشل إرسال "${title}": ${e.message}`);
+    log(`❌ فشل إرسال الخبر: ${e.message}`);
     return false;
   }
 }
@@ -245,38 +219,61 @@ async function sendNewsItem(item) {
 async function processAllAccounts() {
   for (const account of NITTER_ACCOUNTS) {
     const items = await fetchRSS(account);
+    if (items.length === 0) continue;
+
+    // فرز العناصر حسب تاريخ النشر (من الأقدم للأحدث)
+    items.sort((a, b) => {
+      const dateA = new Date(a.pubDate || 0).getTime();
+      const dateB = new Date(b.pubDate || 0).getTime();
+      return dateA - dateB;
+    });
+
+    // جلب آخر تاريخ نشر تمت معالجته
+    const lastDate = getLastPubDate(account);
+    let latestProcessedDate = lastDate;
+
     for (const item of items) {
-      const title = item.title || '';
-      const description = item.contentSnippet || item.content || '';
-
-      // فلترة AI
-      if (USE_AI_FILTER) {
-        const relevant = await isRelevantNewsAI(title, description);
-        if (!relevant) continue;
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
-
-      // بصمة المنع
-      const hash = generateHash(title, description);
-      if (seenHashes.has(hash)) {
-        // تخطي المكرر
+      const pubDate = item.pubDate || new Date().toISOString();
+      // تجاهل الأخبار الأقدم من آخر تاريخ معالج (لتجنب القديم)
+      if (lastDate && new Date(pubDate) <= new Date(lastDate)) {
         continue;
       }
 
-      const sent = await sendNewsItem(item);
+      const title = item.title || 'بدون عنوان';
+      const description = item.contentSnippet || item.content || '';
+
+      // توليد بصمة فريدة
+      const hash = require('crypto').createHash('sha256').update(title + description.substring(0, 60)).digest('hex');
+
+      if (isNewsDuplicate(hash)) continue; // مكرر
+
+      // صياغة الخبر بالذكاء الاصطناعي
+      const formattedText = await formatNewsWithAI(title, description);
+
+      // إرسال الخبر
+      const sent = await sendNews(formattedText, item);
       if (sent) {
-        seenHashes.add(hash);
-        saveLocalHashes();
-        pushHashesToGitHub().catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        // حفظ البصمة في قاعدة البيانات
+        saveNewsHash(hash, title, item.link, pubDate);
+        // تحديث آخر تاريخ
+        if (!latestProcessedDate || new Date(pubDate) > new Date(latestProcessedDate)) {
+          latestProcessedDate = pubDate;
+        }
+        // تأخير بسيط بين الإرسال
+        await new Promise(resolve => setTimeout(resolve, 1500));
       } else {
-        log(`⏳ إعادة محاولة "${title}" لاحقاً.`);
+        log(`⏳ فشل إرسال "${title}"، سيُعاد لاحقاً.`);
       }
+    }
+
+    // تحديث آخر تاريخ معالج للحساب
+    if (latestProcessedDate && latestProcessedDate !== lastDate) {
+      updateLastPubDate(account, latestProcessedDate);
     }
   }
 }
 
-// ---------- دورة 15 نشاط / 3 راحة ----------
+// ---------- دورة النشاط / الراحة ----------
 let fetchTimer = null;
 let activeTimeout = null;
 let restTimeout = null;
@@ -284,15 +281,17 @@ let restTimeout = null;
 function startActiveCycle() {
   if (fetchTimer) clearInterval(fetchTimer);
   log('🟢 بدء دورة النشاط (15 دقيقة).');
-  // تنفيذ فوري
+  // جلب فوري
   processAllAccounts().catch(e => log('خطأ: ' + e));
   fetchTimer = setInterval(() => {
-    log('🔍 جلب دوري داخل النافذة النشطة.');
+    log('🔍 جلب دوري...');
     processAllAccounts().catch(e => log('خطأ: ' + e));
+    // نسخ احتياطي كل 10 دقائق
+    backupToGitHub().catch(() => {});
   }, FETCH_INTERVAL);
 
   activeTimeout = setTimeout(() => {
-    log('🔴 انتهت دورة النشاط، الدخول في راحة 3 دقائق.');
+    log('🔴 انتهت النشاط، راحة 3 دقائق.');
     stopFetching();
     restTimeout = setTimeout(() => {
       startActiveCycle();
@@ -318,56 +317,35 @@ function stopFetching() {
 // ---------- لوحة التحكم ----------
 let expectingCodeUpdate = false;
 
-// مستمع document لاستقبال ملف التحديث (يعمل فقط عندما expectingCodeUpdate = true)
 bot.on('document', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID || !expectingCodeUpdate) return;
   const fileId = ctx.message.document.file_id;
   const fileName = ctx.message.document.file_name || 'bot.js';
-  if (!fileName.endsWith('.js')) {
-    return ctx.reply('❌ الملف يجب أن يكون .js');
-  }
+  if (!fileName.endsWith('.js')) return ctx.reply('❌ يجب أن يكون الملف .js');
   try {
     const fileUrl = await bot.telegram.getFileLink(fileId);
-    const response = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
-    const code = Buffer.from(response.data).toString('utf8');
-    const currentFile = path.join(__dirname, 'bot.js');
-    fs.writeFileSync(currentFile, code, 'utf8');
-    ctx.reply('✅ تم تحديث الكود. جاري إعادة التشغيل...');
+    const res = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
+    fs.writeFileSync(__filename, Buffer.from(res.data));
+    ctx.reply('✅ تم تحديث الكود. إعادة التشغيل...');
     log('🔄 إعادة تشغيل البوت لتطبيق الكود الجديد.');
     stopFetching();
     setTimeout(() => process.exit(0), 1000);
   } catch (e) {
-    ctx.reply('❌ فشل تحديث الكود: ' + e.message);
+    ctx.reply('❌ فشل التحديث: ' + e.message);
   }
   expectingCodeUpdate = false;
 });
 
-// الأوامر
 bot.command('start', (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ غير مصرح.');
-  ctx.reply('👋 مرحباً أدمن. استخدم /help للأوامر.');
-});
-
-bot.command('help', (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  ctx.reply(`📋 الأوامر المتاحة:
-/status - حالة البوت
-/logs - آخر السجلات
-/updatecode - تحديث الكود
-/filters - عرض القوائم
-/addwhite كلمة
-/delwhite كلمة
-/addblack كلمة
-/delblack كلمة`);
+  ctx.reply('👋 مرحباً أدمن. أوامر: /status /logs /updatecode');
 });
 
 bot.command('status', (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const active = fetchTimer ? 'نشط' : 'متوقف';
-  ctx.reply(`✅ البوت يعمل
-📡 حالة الجلب: ${active}
-📬 الأخبار المخزنة: ${seenHashes.size}
-🕒 الوقت: ${new Date().toLocaleString()}`);
+  const count = db.prepare('SELECT COUNT(*) as cnt FROM news').get().cnt;
+  ctx.reply(`✅ البوت يعمل\n📡 الجلب: ${active}\n📬 الأخبار المحفوظة: ${count}\n🕒 ${new Date().toLocaleString()}`);
 });
 
 bot.command('logs', (ctx) => {
@@ -379,72 +357,25 @@ bot.command('logs', (ctx) => {
 bot.command('updatecode', (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   expectingCodeUpdate = true;
-  ctx.reply('📥 أرسل ملف bot.js الجديد الآن (خلال 30 ثانية).');
+  ctx.reply('📥 أرسل ملف bot.js الجديد (خلال 30 ثانية).');
   setTimeout(() => { expectingCodeUpdate = false; }, 30000);
 });
 
-bot.command('filters', (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  ctx.reply(`📋 <b>القائمة البيضاء (${WHITELIST.length}):</b>\n${WHITELIST.join(', ') || 'فارغة'}\n\n🚫 <b>القائمة السوداء (${BLACKLIST.length}):</b>\n${BLACKLIST.join(', ') || 'فارغة'}`, { parse_mode: 'HTML' });
-});
-bot.command('addwhite', (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const word = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  if (!word) return ctx.reply('❌ استخدم: /addwhite كلمة');
-  if (WHITELIST.includes(word)) return ctx.reply('موجودة مسبقاً.');
-  WHITELIST.push(word);
-  saveFilters();
-  ctx.reply(`✅ أُضيفت "${word}".`);
-});
-bot.command('delwhite', (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const word = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  if (!word) return ctx.reply('❌ استخدم: /delwhite كلمة');
-  WHITELIST = WHITELIST.filter(w => w !== word);
-  saveFilters();
-  ctx.reply(`🗑️ حُذفت "${word}".`);
-});
-bot.command('addblack', (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const word = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  if (!word) return ctx.reply('❌ استخدم: /addblack كلمة');
-  if (BLACKLIST.includes(word)) return ctx.reply('موجودة مسبقاً.');
-  BLACKLIST.push(word);
-  saveFilters();
-  ctx.reply(`✅ أُضيفت "${word}".`);
-});
-bot.command('delblack', (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const word = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  if (!word) return ctx.reply('❌ استخدم: /delblack كلمة');
-  BLACKLIST = BLACKLIST.filter(w => w !== word);
-  saveFilters();
-  ctx.reply(`🗑️ حُذفت "${word}".`);
-});
-
-// ---------- تهيئة البوت ----------
+// ---------- تشغيل البوت ----------
 async function init() {
-  loadLocalHashes();
-  await fetchRemoteHashes();
-  loadFilters();
+  // تحميل قاعدة البيانات (قد تكون موجودة)
+  log(`📊 قاعدة البيانات جاهزة.`);
 
-  // تشغيل البوت (تستقبل الأوامر)
   bot.launch();
-  log('🤖 بوت الأخبار بدأ العمل.');
+  log('🤖 بوت الأخبار بدأ.');
 
-  // بدء الدورة
   startActiveCycle();
 }
 
-// معالجة الأعطال
-process.on('uncaughtException', (err) => {
-  log('💥 خطأ غير متوقع: ' + err.message);
-});
-process.on('unhandledRejection', (reason) => {
-  log('⚠️ وعد مرفوض: ' + reason);
-});
+process.on('uncaughtException', (err) => log('💥 خطأ: ' + err.message));
+process.on('unhandledRejection', (reason) => log('⚠️ وعد: ' + reason));
 
 init().catch(err => {
-  log('❌ فشل بدء التشغيل: ' + err.message);
+  log('فشل البدء: ' + err.message);
   process.exit(1);
 });
